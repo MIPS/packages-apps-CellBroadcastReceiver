@@ -31,8 +31,11 @@ import android.preference.PreferenceManager;
 import android.provider.Telephony;
 import android.telephony.CellBroadcastMessage;
 import android.telephony.SmsCbCmasInfo;
+import android.telephony.SmsCbLocation;
 import android.telephony.SmsCbMessage;
 import android.util.Log;
+
+import java.util.HashSet;
 
 /**
  * This service manages the display and animation of broadcast messages.
@@ -50,6 +53,9 @@ public class CellBroadcastAlertService extends Service {
     /** Intent extra to indicate a previously unread alert. */
     static final String NEW_ALERT_EXTRA = "com.android.cellbroadcastreceiver.NEW_ALERT";
 
+    /** Intent action to display alert dialog/notification, after verifying the alert is new. */
+    static final String SHOW_NEW_ALERT_ACTION = "cellbroadcastreceiver.SHOW_NEW_ALERT";
+
     /** Use the same notification ID for non-emergency alerts. */
     static final int NOTIFICATION_ID = 1;
 
@@ -59,16 +65,53 @@ public class CellBroadcastAlertService extends Service {
     /** Hold the wake lock for 5 seconds, which should be enough time to display the alert. */
     private static final int WAKE_LOCK_TIMEOUT = 5000;
 
+    /** Container for message ID and geographical scope, for duplicate message detection. */
+    private static final class MessageIdAndScope {
+        private final int mMessageId;
+        private final SmsCbLocation mLocation;
+
+        MessageIdAndScope(int messageId, SmsCbLocation location) {
+            mMessageId = messageId;
+            mLocation = location;
+        }
+
+        @Override
+        public int hashCode() {
+            return mMessageId * 31 + mLocation.hashCode();
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (o == this) {
+                return true;
+            }
+            if (o instanceof MessageIdAndScope) {
+                MessageIdAndScope other = (MessageIdAndScope) o;
+                return (mMessageId == other.mMessageId && mLocation.equals(other.mLocation));
+            }
+            return false;
+        }
+
+        @Override
+        public String toString() {
+            return "{messageId: " + mMessageId + " location: " + mLocation.toString() + '}';
+        }
+    }
+
+    /** Cache of received message IDs, for duplicate message detection. */
+    private static final HashSet<MessageIdAndScope> sCmasIdList = new HashSet<MessageIdAndScope>(8);
+
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent.getAction();
         if (Telephony.Sms.Intents.SMS_EMERGENCY_CB_RECEIVED_ACTION.equals(action) ||
                 Telephony.Sms.Intents.SMS_CB_RECEIVED_ACTION.equals(action)) {
             handleCellBroadcastIntent(intent);
+        } else if (SHOW_NEW_ALERT_ACTION.equals(action)) {
+            showNewAlert(intent);
         } else {
             Log.e(TAG, "Unrecognized intent action: " + action);
         }
-        stopSelf(); // this service always stops after processing the intent
         return START_NOT_STICKY;
     }
 
@@ -93,6 +136,48 @@ public class CellBroadcastAlertService extends Service {
             return;
         }
 
+        // Set.add() returns false if message ID has already been added
+        MessageIdAndScope messageIdAndScope = new MessageIdAndScope(message.getSerialNumber(),
+                message.getLocation());
+        if (!sCmasIdList.add(messageIdAndScope)) {
+            Log.d(TAG, "ignoring duplicate alert with " + messageIdAndScope);
+            return;
+        }
+
+        final Intent alertIntent = new Intent(SHOW_NEW_ALERT_ACTION);
+        alertIntent.setClass(this, CellBroadcastAlertService.class);
+        alertIntent.putExtra("message", cbm);
+
+        // write to database on a background thread
+        new CellBroadcastContentProvider.AsyncCellBroadcastTask(getContentResolver())
+                .execute(new CellBroadcastContentProvider.CellBroadcastOperation() {
+                    @Override
+                    public boolean execute(CellBroadcastContentProvider provider) {
+                        if (provider.insertNewBroadcast(cbm)) {
+                            // new message, show the alert or notification on UI thread
+                            startService(alertIntent);
+                            return true;
+                        } else {
+                            return false;
+                        }
+                    }
+                });
+    }
+
+    private void showNewAlert(Intent intent) {
+        Bundle extras = intent.getExtras();
+        if (extras == null) {
+            Log.e(TAG, "received SHOW_NEW_ALERT_ACTION with no extras!");
+            return;
+        }
+
+        CellBroadcastMessage cbm = (CellBroadcastMessage) extras.get("message");
+
+        if (cbm == null) {
+            Log.e(TAG, "received SHOW_NEW_ALERT_ACTION with no message extra");
+            return;
+        }
+
         if (cbm.isEmergencyAlertMessage() || CellBroadcastConfigService
                 .isOperatorDefinedEmergencyId(cbm.getServiceCategory())) {
             // start alert sound / vibration / TTS and display full-screen alert
@@ -101,15 +186,6 @@ public class CellBroadcastAlertService extends Service {
             // add notification to the bar
             addToNotificationBar(cbm);
         }
-
-        // write to database on a background thread
-        new CellBroadcastContentProvider.AsyncCellBroadcastTask(getContentResolver())
-                .execute(new CellBroadcastContentProvider.CellBroadcastOperation() {
-                    @Override
-                    public boolean execute(CellBroadcastContentProvider provider) {
-                        return provider.insertNewBroadcast(cbm);
-                    }
-                });
     }
 
     /**
